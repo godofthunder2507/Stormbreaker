@@ -40,12 +40,24 @@ MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 EMA_TREND_FAST, EMA_TREND_SLOW = 50, 200
 ATR_PERIOD = 14
 SUPPORT_RESISTANCE_LOOKBACK = 50
-SR_PROXIMITY = 3.0   # how close price must be to S/R to count as "near" ($)
+SR_PROXIMITY = 5.0   # widened from 3.0 so "near" S/R triggers more easily
 
-MIN_CONFIRMATIONS = 3          # out of 4 conditions
-SIGNAL_COOLDOWN_MINUTES = 30
-ATR_SL_MULTIPLIER = 1.5
-ATR_TP_MULTIPLIER = 2.5
+MIN_CONFIRMATIONS = 2          # lowered from 3, out of 4 - fires more often
+SIGNAL_COOLDOWN_MINUTES = 10   # lowered from 30 - shorter than the 15min check cycle
+
+# ---- Fixed dollar profit/stop targets (replaces the old ATR-based sizing) ----
+# Calculated from your position size: 1 standard lot = 100 oz, so the price
+# move needed for a given $ profit/loss = target_dollars / (lots * 100).
+# At 0.01 lot (1 oz), $1 of price movement = $1 of profit/loss, so the
+# distances below are just the dollar targets directly.
+POSITION_SIZE_LOTS = 0.01
+OZ_PER_LOT = 100
+TARGET_PROFIT_USD = 15
+TARGET_STOP_USD = 10           # ~1:1.5 reward:risk - edit to taste
+
+position_oz = POSITION_SIZE_LOTS * OZ_PER_LOT
+TP_DISTANCE = TARGET_PROFIT_USD / position_oz
+SL_DISTANCE = TARGET_STOP_USD / position_oz
 
 STATE_FILE = Path(__file__).parent / "state.json"
 
@@ -145,7 +157,6 @@ def analyse(entry_df, htf_df):
     near_support = abs(last_price - support) <= SR_PROXIMITY
     near_resistance = abs(last_price - resistance) <= SR_PROXIMITY
     trend = determine_trend(htf_df)
-    atr_value = atr(entry_df, ATR_PERIOD).iloc[-1]
 
     buy_reasons, sell_reasons = [], []
     if bullish_cross:
@@ -173,11 +184,11 @@ def analyse(entry_df, htf_df):
         direction, reasons, confidence = "SELL", sell_reasons, len(sell_reasons)
 
     if direction == "BUY":
-        stop_loss = last_price - atr_value * ATR_SL_MULTIPLIER
-        take_profit = last_price + atr_value * ATR_TP_MULTIPLIER
+        stop_loss = last_price - SL_DISTANCE
+        take_profit = last_price + TP_DISTANCE
     elif direction == "SELL":
-        stop_loss = last_price + atr_value * ATR_SL_MULTIPLIER
-        take_profit = last_price - atr_value * ATR_TP_MULTIPLIER
+        stop_loss = last_price + SL_DISTANCE
+        take_profit = last_price - TP_DISTANCE
     else:
         stop_loss = take_profit = 0.0
 
@@ -214,6 +225,7 @@ def format_message(signal):
         f"Entry: `{signal.entry_price}`",
         f"Stop Loss: `{signal.stop_loss}`",
         f"Take Profit: `{signal.take_profit}`",
+        f"(targets ~${TARGET_PROFIT_USD} profit / ${TARGET_STOP_USD} risk at {POSITION_SIZE_LOTS} lot)",
         f"Trend (H1): {signal.trend}",
         f"RSI: {signal.rsi_value}",
         "",
@@ -263,11 +275,10 @@ def main():
         if send_telegram(format_message(result)):
             state["last_direction"] = result.direction
             state["last_sent_time"] = now.isoformat()
+            save_state(state)
             print("Telegram alert sent.")
     else:
         print("No alert sent this cycle.")
-
-    save_state(state)
 
 
 if __name__ == "__main__":
