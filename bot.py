@@ -263,10 +263,11 @@ def main():
         if send_telegram(format_message(result)):
             state["last_direction"] = result.direction
             state["last_sent_time"] = now.isoformat()
-            save_state(state)
             print("Telegram alert sent.")
     else:
         print("No alert sent this cycle.")
+
+    save_state(state)
 
 
 if __name__ == "__main__":
