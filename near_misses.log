@@ -49,3 +49,4 @@
 [2026-07-18 09:26:24] SUPPRESSED (volatility) - would have been BUY 2/4 @ 4010.62 | ATR 0.415 vs baseline 2.151 (ratio 0.7) | reasons: RSI healthy/bullish at 52.1, Price near support (4010.49)
 [2026-07-18 10:46:56] SUPPRESSED (volatility) - would have been SELL 3/4 @ 4010.53 | ATR 0.348 vs baseline 1.482 (ratio 0.7) | reasons: RSI healthy/bearish at 49.2, Price near resistance (4010.73), H1 trend is DOWN
 [2026-07-18 11:53:09] SUPPRESSED (volatility) - would have been BUY 2/4 @ 4010.61 | ATR 0.322 vs baseline 1.163 (ratio 0.7) | reasons: RSI healthy/bullish at 51.8, Price near support (4010.49)
+[2026-07-18 13:16:40] SUPPRESSED (volatility) - would have been BUY 2/4 @ 4010.62 | ATR 0.286 vs baseline 0.832 (ratio 0.7) | reasons: RSI healthy/bullish at 52.5, Price near support (4010.49)
