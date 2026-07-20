@@ -57,3 +57,4 @@
 [2026-07-18 18:37:20] SUPPRESSED (volatility) - would have been SELL 3/4 @ 4010.52 | ATR 0.249 vs baseline 0.364 (ratio 0.7) | reasons: RSI healthy/bearish at 47.5, Price near resistance (4010.71), H1 trend is DOWN
 [2026-07-19 22:35:05] NEAR MISS - would be BUY 1/4, 1 short @ 3996.19 | RSI 2.54 | Trend(H1) DOWN | reasons: Price near support (3995.28)
 [2026-07-19 23:40:05] NEAR MISS - would be BUY 1/4, 1 short @ 3992.5 | RSI 12.18 | Trend(H1) DOWN | reasons: Price near support (3989.30)
+[2026-07-20 21:48:52] SUPPRESSED (volatility) - would have been SELL 3/4 @ 4006.27 | ATR 4.015 vs baseline 6.318 (ratio 0.7) | reasons: RSI healthy/bearish at 43.8, Price near resistance (4008.50), H1 trend is DOWN
