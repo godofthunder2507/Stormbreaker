@@ -2,9 +2,9 @@
 XAUUSD Signal Bot - single-file cloud version.
 
 Runs on a schedule (GitHub Actions) instead of as an always-on desktop app.
-Each run: fetch latest gold price data -> analyse with a multi-indicator
-strategy -> send a Telegram alert if a BUY/SELL signal fires -> save state
-for cooldown tracking -> exit.
+Each run: check the market is actually open -> fetch latest gold price data
+-> analyse with a multi-indicator strategy -> send a Telegram alert if a
+BUY/SELL signal fires -> save state for cooldown tracking -> exit.
 
 Secrets (Telegram token/chat ID, Twelve Data API key) are read from
 environment variables, which GitHub Actions injects from encrypted
@@ -22,13 +22,48 @@ CHANGELOG (this version):
   firing, or that fired but got suppressed by the volatility filter, gets
   appended to near_misses.log so you have an audit trail of what the bot
   almost (or technically did) call instead of total silence.
+- NEW: Market-hours gate. Spot gold trades Sun 17:00 ET - Fri 17:00 ET.
+  The bot now hard-checks the actual wall-clock day/time in New York
+  (DST-aware, via zoneinfo - not a guessed fixed UTC window) before doing
+  ANY work, and exits immediately if the market is closed. This is on top
+  of trimming the GitHub Actions cron itself to skip Saturday. Belt and
+  suspenders: cron handles the bulk of Saturday for free (saves Action
+  minutes), this in-code check is the actual authoritative gate and
+  correctly handles the Friday-evening-close / Sunday-evening-open edges
+  that a cron day-of-week field can't express on its own.
+- NEW: Closed-candle trim + staleness check. The most recent candle
+  returned by the API is dropped if it isn't finished yet (its close time
+  hasn't passed), so indicators never fire off a still-forming bar. After
+  that trim, if the latest CLOSED candle is still implausibly old (well
+  beyond normal scheduling jitter), the cycle is skipped entirely - this
+  catches market holidays that a plain weekday check can't (Christmas,
+  New Year, etc.), where the feed just repeats a stale last close.
+- NEW: ATR-scaled SL/TP. Stop-loss and take-profit are no longer a fixed
+  $10/$15 - they're computed from the CURRENT ATR reading at signal time
+  (1.5x ATR stop / 2.5x ATR target), then widened further if needed so
+  the stop sits beyond the bot's own calculated support/resistance level
+  rather than arbitrarily close to it. Both figures come from live market
+  data every run, not a static guess.
+- NEW: H1 trend is now also a hard filter, not just one of four optional
+  votes. A BUY is blocked outright if H1 trend is DOWN, and a SELL is
+  blocked outright if H1 trend is UP - stops the bot calling reversals
+  straight into a strong opposing trend. Trend agreement still counts as
+  a confirmation vote as before; this adds a veto on top when it actively
+  disagrees, it doesn't replace the vote.
+- NEW: minimum reward:risk gate. Found during local validation testing -
+  when the ATR-based stop gets widened past support/resistance (see
+  above), the realised reward:risk on that specific signal can come out
+  worse than intended. Rather than firing anyway because the confirmation
+  count looks fine, the signal is suppressed if reward:risk would be
+  below 1:1 once the real (possibly-widened) stop is accounted for.
 """
 
 import json
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -43,7 +78,9 @@ TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "")
 
 SYMBOL = "XAU/USD"
 ENTRY_TIMEFRAME = "15min"
+ENTRY_TIMEFRAME_MINUTES = 15
 TREND_TIMEFRAME = "1h"
+TREND_TIMEFRAME_MINUTES = 60
 CANDLES_TO_FETCH = 200
 
 RSI_PERIOD = 14
@@ -53,10 +90,10 @@ MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 EMA_TREND_FAST, EMA_TREND_SLOW = 50, 200
 ATR_PERIOD = 14
 SUPPORT_RESISTANCE_LOOKBACK = 50
-SR_PROXIMITY = 5.0   # widened from 3.0 so "near" S/R triggers more easily
+SR_PROXIMITY = 5.0  # widened from 3.0 so "near" S/R triggers more easily
 
-MIN_CONFIRMATIONS = 2          # lowered from 3, out of 4 - fires more often
-SIGNAL_COOLDOWN_MINUTES = 10   # lowered from 30 - shorter than the 15min check cycle
+MIN_CONFIRMATIONS = 2  # lowered from 3, out of 4 - fires more often
+SIGNAL_COOLDOWN_MINUTES = 10  # lowered from 30 - shorter than the 15min check cycle
 
 # ---- Volatility filter ----
 # Compares the current ATR to its own recent average. If the market is
@@ -67,35 +104,128 @@ SIGNAL_COOLDOWN_MINUTES = 10   # lowered from 30 - shorter than the 15min check 
 ATR_BASELINE_LOOKBACK = 50
 MIN_VOLATILITY_RATIO = 0.7
 
+# ---- Market hours gate ----
+# Spot gold (XAUUSD) trades continuously from Sunday 17:00 ET to Friday
+# 17:00 ET. Using zoneinfo (not a fixed UTC offset) so this stays correct
+# across the US DST transitions automatically - a guessed fixed UTC
+# window would silently be an hour wrong for half the year.
+MARKET_TZ = ZoneInfo("America/New_York")
+MARKET_CLOSE_WEEKDAY = 4  # Monday=0 ... Friday=4
+MARKET_CLOSE_HOUR = 17
+MARKET_OPEN_WEEKDAY = 6  # Sunday
+MARKET_OPEN_HOUR = 17
+
+# ---- Closed-candle / staleness handling ----
+# After trimming to the last fully-closed candle, if that candle is still
+# older than this, treat it as "no fresh data" and skip the cycle rather
+# than analysing a stale repeat of the last real close. Deliberately
+# generous (not set to ~20-30min) because GitHub Actions' own scheduler
+# does not reliably honour a */15 cron under load - observed gaps between
+# runs of an hour or more are normal scheduling jitter, not a market
+# closure, and this check must not mistake one for the other.
+MAX_CANDLE_AGE_MINUTES = 150
+
+# ---- Fixed dollar profit/stop targets (legacy - kept only for the
+# Telegram $ display conversion below, no longer used to size the stop) ----
+POSITION_SIZE_LOTS = 0.01
+OZ_PER_LOT = 100
+position_oz = POSITION_SIZE_LOTS * OZ_PER_LOT
+
+# ---- ATR-based SL/TP ----
+# Stop/target are computed per-run from the CURRENT ATR reading, not a
+# static guess. 1.5x ATR for the stop keeps it outside normal single-candle
+# noise (the bot's own logged ATR readings during active hours run
+# roughly $3-10 per 15min candle - a flat $10 stop, as this bot used to
+# have, sits inside that noise band). 2.5x ATR target keeps a ~1:1.67
+# reward:risk, similar to the previous 1:1.5 but now scaling with real
+# conditions instead of being fixed. These are standard, widely-used
+# ATR-stop multiples (not tuned to this bot's own trade history yet,
+# since trades.csv only has 1 logged trade so far - not enough sample to
+# fit bot-specific multiples). Keep logging real trades in trades.csv;
+# analyze_thresholds.py can be extended later to tune these multiples
+# once there's enough evidence to do so responsibly.
+ATR_SL_MULTIPLIER = 1.5
+ATR_TP_MULTIPLIER = 2.5
+# If ATR-based stop would sit tighter than the bot's own calculated
+# support/resistance level, push it just beyond that level instead - the
+# stop should never be closer than known structure. Buffer is itself
+# ATR-scaled rather than a flat guessed number.
+SR_STOP_BUFFER_ATR = 0.25
+# Found during local validation testing: widening the stop past support/
+# resistance can turn a healthy ~1:1.67 planned reward:risk into a much
+# worse one on that particular signal. Rather than firing a trade with a
+# degraded ratio just because the direction/confirmations look right,
+# suppress it - a trade isn't worth taking on confirmations alone if the
+# risk you'd actually be taking no longer justifies the reward.
+MIN_REWARD_RISK_RATIO = 1.0
+
 # ---- Near-miss logging ----
 # Anything that didn't fire but came close (or fired and got volatility-
-# suppressed) gets written here so you can see what you're NOT being
-# alerted on, instead of it disappearing into a silent HOLD.
+# or trend-suppressed) gets written here so you can see what you're NOT
+# being alerted on, instead of it disappearing into a silent HOLD.
 NEAR_MISS_LOG = Path(__file__).parent / "near_misses.log"
 NEAR_MISS_LOG_MAX_LINES = 300
 
-# ---- Fixed dollar profit/stop targets (replaces the old ATR-based sizing) ----
-# Calculated from your position size: 1 standard lot = 100 oz, so the price
-# move needed for a given $ profit/loss = target_dollars / (lots * 100).
-# At 0.01 lot (1 oz), $1 of price movement = $1 of profit/loss, so the
-# distances below are just the dollar targets directly.
-POSITION_SIZE_LOTS = 0.01
-OZ_PER_LOT = 100
-TARGET_PROFIT_USD = 15
-TARGET_STOP_USD = 10           # ~1:1.5 reward:risk - edit to taste
-
-position_oz = POSITION_SIZE_LOTS * OZ_PER_LOT
-TP_DISTANCE = TARGET_PROFIT_USD / position_oz
-SL_DISTANCE = TARGET_STOP_USD / position_oz
-
 STATE_FILE = Path(__file__).parent / "state.json"
 
+# =====================================================================
+# MARKET HOURS
+# =====================================================================
+def market_is_open(now_utc):
+    """True if spot gold is trading right now (Sun 17:00 ET - Fri 17:00 ET).
+
+    DST-aware via zoneinfo - deliberately not a fixed UTC offset, since a
+    fixed offset would be wrong for roughly half the year across the US
+    DST transitions.
+    """
+    now_et = now_utc.astimezone(MARKET_TZ)
+    weekday = now_et.weekday()  # Monday=0 ... Sunday=6
+
+    if weekday == 5:  # Saturday - always closed
+        return False
+    if weekday == 6 and now_et.hour < MARKET_OPEN_HOUR:  # Sunday before open
+        return False
+    if weekday == MARKET_CLOSE_WEEKDAY and now_et.hour >= MARKET_CLOSE_HOUR:  # Friday after close
+        return False
+    return True
+
+
+def trim_to_closed_candles(df, timeframe_minutes, now_utc):
+    """Drop the last row if it's still forming (its close time is in the future).
+
+    Guarantees indicators are always computed off a fully-closed candle,
+    regardless of whether the data provider includes an in-progress bar.
+    """
+    if df.empty:
+        return df
+    last_open = df["time"].iloc[-1]
+    if last_open.tzinfo is None:
+        last_open = last_open.tz_localize("UTC")
+    close_time = last_open + timedelta(minutes=timeframe_minutes)
+    if close_time > now_utc:
+        return df.iloc[:-1].reset_index(drop=True)
+    return df
+
+
+def latest_candle_age_minutes(df, now_utc):
+    if df.empty:
+        return float("inf")
+    last_time = df["time"].iloc[-1]
+    if last_time.tzinfo is None:
+        last_time = last_time.tz_localize("UTC")
+    return (now_utc - last_time).total_seconds() / 60.0
 
 # =====================================================================
 # MARKET DATA (Twelve Data free API)
 # =====================================================================
 def get_candles(symbol, interval, count):
-    params = {"symbol": symbol, "interval": interval, "outputsize": count, "apikey": TWELVE_DATA_API_KEY}
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": count,
+        "apikey": TWELVE_DATA_API_KEY,
+        "timezone": "UTC",  # explicit, so staleness/candle-close math is unambiguous
+    }
     resp = requests.get("https://api.twelvedata.com/time_series", params=params, timeout=15)
     resp.raise_for_status()
     data = resp.json()
@@ -104,16 +234,14 @@ def get_candles(symbol, interval, count):
     df = pd.DataFrame(data["values"]).rename(columns={"datetime": "time"})
     for col in ["open", "high", "low", "close"]:
         df[col] = df[col].astype(float)
-    df["time"] = pd.to_datetime(df["time"])
+    df["time"] = pd.to_datetime(df["time"], utc=True)
     return df.sort_values("time").reset_index(drop=True)
-
 
 # =====================================================================
 # INDICATORS
 # =====================================================================
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
-
 
 def rsi(series, period):
     delta = series.diff()
@@ -124,19 +252,16 @@ def rsi(series, period):
     rs = avg_gain / avg_loss.replace(0, np.nan)
     return (100 - 100 / (1 + rs)).fillna(50)
 
-
 def macd(series, fast, slow, signal):
     macd_line = ema(series, fast) - ema(series, slow)
     signal_line = ema(macd_line, signal)
     return macd_line, signal_line
-
 
 def atr(df, period):
     high, low, close = df["high"], df["low"], df["close"]
     prev_close = close.shift(1)
     tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1 / period, min_periods=period).mean()
-
 
 def find_support_resistance(df, lookback):
     recent = df.tail(lookback)
@@ -149,7 +274,6 @@ def find_support_resistance(df, lookback):
     nearest_resistance = resistances.min() if not resistances.empty else recent["high"].max()
     nearest_support = supports.max() if not supports.empty else recent["low"].min()
     return nearest_support, nearest_resistance
-
 
 def compute_volatility_ok(atr_series):
     """Compare current ATR to its recent baseline average.
@@ -166,7 +290,6 @@ def compute_volatility_ok(atr_series):
     if not atr_baseline or np.isnan(atr_baseline) or atr_baseline <= 0:
         return atr_now, atr_baseline, True
     return atr_now, atr_baseline, bool(atr_now >= MIN_VOLATILITY_RATIO * atr_baseline)
-
 
 # =====================================================================
 # SIGNAL ENGINE
@@ -197,13 +320,43 @@ class SignalResult:
     atr_baseline: float = 0.0
     volatility_ok: bool = True
     suppressed_by_volatility: bool = False
-
+    suppressed_by_trend: bool = False
+    suppressed_by_poor_rr: bool = False
+    sl_tp_note: str = ""
 
 def determine_trend(htf_df):
     close = htf_df["close"]
     fast, slow = ema(close, EMA_TREND_FAST).iloc[-1], ema(close, EMA_TREND_SLOW).iloc[-1]
     return "UP" if fast > slow else "DOWN" if fast < slow else "RANGE"
 
+def compute_sl_tp(direction, last_price, atr_now, support, resistance):
+    """ATR-scaled SL/TP, widened past the bot's own S/R level if needed.
+
+    Both distances are derived from live data every run (current ATR,
+    current calculated support/resistance) rather than a fixed number.
+    """
+    note = ""
+    if direction == "BUY":
+        sl_from_atr = last_price - ATR_SL_MULTIPLIER * atr_now
+        tp = last_price + ATR_TP_MULTIPLIER * atr_now
+        sl = sl_from_atr
+        if pd.notna(support) and support < last_price:
+            sl_beyond_support = support - SR_STOP_BUFFER_ATR * atr_now
+            if sl_beyond_support < sl:
+                sl = sl_beyond_support
+                note = "SL widened beyond support"
+    elif direction == "SELL":
+        sl_from_atr = last_price + ATR_SL_MULTIPLIER * atr_now
+        tp = last_price - ATR_TP_MULTIPLIER * atr_now
+        sl = sl_from_atr
+        if pd.notna(resistance) and resistance > last_price:
+            sl_beyond_resistance = resistance + SR_STOP_BUFFER_ATR * atr_now
+            if sl_beyond_resistance > sl:
+                sl = sl_beyond_resistance
+                note = "SL widened beyond resistance"
+    else:
+        sl = tp = 0.0
+    return sl, tp, note
 
 def analyse(entry_df, htf_df):
     close = entry_df["close"]
@@ -257,26 +410,49 @@ def analyse(entry_df, htf_df):
     else:
         best_direction, best_confidence, best_reasons = "SELL", confirmations_sell, sell_reasons
 
-    # Apply volatility filter: a real BUY/SELL signal gets downgraded to HOLD
-    # if the market is unusually quiet right now.
-    suppressed = False
-    if raw_direction in ("BUY", "SELL") and not volatility_ok:
-        direction, reasons, confidence = "HOLD", [], 0
-        suppressed = True
-    else:
-        direction, reasons, confidence = raw_direction, raw_reasons, raw_confidence
+    # Hard trend filter: block a signal that calls a reversal straight into
+    # a strong opposing H1 trend, on top of trend counting as a vote above.
+    suppressed_by_trend = False
+    if raw_direction == "BUY" and trend == "DOWN":
+        suppressed_by_trend = True
+    elif raw_direction == "SELL" and trend == "UP":
+        suppressed_by_trend = True
 
-    if direction == "BUY":
-        stop_loss = last_price - SL_DISTANCE
-        take_profit = last_price + TP_DISTANCE
-    elif direction == "SELL":
-        stop_loss = last_price + SL_DISTANCE
-        take_profit = last_price - TP_DISTANCE
+    if suppressed_by_trend:
+        direction, reasons, confidence = "HOLD", [], 0
+        suppressed = False
+    else:
+        # Apply volatility filter: a real BUY/SELL signal gets downgraded to
+        # HOLD if the market is unusually quiet right now.
+        suppressed = False
+        if raw_direction in ("BUY", "SELL") and not volatility_ok:
+            direction, reasons, confidence = "HOLD", [], 0
+            suppressed = True
+        else:
+            direction, reasons, confidence = raw_direction, raw_reasons, raw_confidence
+
+    sl_tp_note = ""
+    suppressed_by_poor_rr = False
+    if direction in ("BUY", "SELL") and pd.notna(atr_now) and atr_now > 0:
+        stop_loss, take_profit, sl_tp_note = compute_sl_tp(direction, last_price, atr_now, support, resistance)
+        risk = abs(last_price - stop_loss)
+        reward = abs(take_profit - last_price)
+        if risk <= 0 or (reward / risk) < MIN_REWARD_RISK_RATIO:
+            # Structural stop (beyond S/R) made this trade's real reward:risk
+            # worse than acceptable - don't fire on confirmations alone.
+            suppressed_by_poor_rr = True
+            direction, reasons, confidence = "HOLD", [], 0
+            stop_loss = take_profit = 0.0
+    elif direction in ("BUY", "SELL"):
+        # No usable ATR reading - can't size a fact-based stop, so don't fire.
+        direction, reasons, confidence = "HOLD", [], 0
+        stop_loss = take_profit = 0.0
+        sl_tp_note = "suppressed - no usable ATR reading to size SL/TP"
     else:
         stop_loss = take_profit = 0.0
 
     return SignalResult(
-        timestamp=datetime.now(), direction=direction, confidence=confidence,
+        timestamp=datetime.now(timezone.utc), direction=direction, confidence=confidence,
         entry_price=round(last_price, 2), stop_loss=round(stop_loss, 2), take_profit=round(take_profit, 2),
         rsi_value=round(last_rsi, 2), trend=trend, support=round(support, 2), resistance=round(resistance, 2),
         reasons=reasons,
@@ -285,8 +461,9 @@ def analyse(entry_df, htf_df):
         atr_value=round(float(atr_now), 3) if pd.notna(atr_now) else 0.0,
         atr_baseline=round(float(atr_baseline), 3) if pd.notna(atr_baseline) else 0.0,
         volatility_ok=volatility_ok, suppressed_by_volatility=suppressed,
+        suppressed_by_trend=suppressed_by_trend, suppressed_by_poor_rr=suppressed_by_poor_rr,
+        sl_tp_note=sl_tp_note,
     )
-
 
 # =====================================================================
 # TELEGRAM
@@ -304,35 +481,56 @@ def send_telegram(text):
         print(f"[Telegram] Failed: {e}")
         return False
 
-
 def format_message(signal):
     emoji = "🟢" if signal.direction == "BUY" else "🔴"
+    sl_distance = abs(signal.entry_price - signal.stop_loss)
+    tp_distance = abs(signal.take_profit - signal.entry_price)
+    est_risk_usd = sl_distance * position_oz
+    est_profit_usd = tp_distance * position_oz
     lines = [
         f"{emoji} *XAUUSD {signal.direction} SIGNAL*",
         f"Confidence: {signal.confidence}/4",
         f"Entry: `{signal.entry_price}`",
         f"Stop Loss: `{signal.stop_loss}`",
         f"Take Profit: `{signal.take_profit}`",
-        f"(targets ~${TARGET_PROFIT_USD} profit / ${TARGET_STOP_USD} risk at {POSITION_SIZE_LOTS} lot)",
+        f"(ATR-based: {ATR_SL_MULTIPLIER}x/{ATR_TP_MULTIPLIER}x ATR({signal.atr_value})"
+        + (f", {signal.sl_tp_note}" if signal.sl_tp_note else "")
+        + f" | ~${est_risk_usd:.2f} risk / ${est_profit_usd:.2f} target at {POSITION_SIZE_LOTS} lot)",
         f"Trend (H1): {signal.trend}",
         f"RSI: {signal.rsi_value}",
         "",
         "*Reasons:*",
-    ] + [f"- {r}" for r in signal.reasons] + [f"\n_{signal.timestamp.strftime('%Y-%m-%d %H:%M:%S')}_"]
+    ] + [f"- {r}" for r in signal.reasons] + [f"\n_{signal.timestamp.strftime('%Y-%m-%d %H:%M:%S')} UTC_"]
     return "\n".join(lines)
-
 
 # =====================================================================
 # NEAR-MISS LOGGING
 # =====================================================================
 def log_near_miss(result):
-    """Append a line if this cycle was a near-miss or a volatility-suppressed
-    signal, so silent HOLDs don't disappear without a trace. Keeps the log
-    trimmed to the last NEAR_MISS_LOG_MAX_LINES lines."""
+    """Append a line if this cycle was a near-miss or a suppressed signal
+    (by volatility or trend), so silent HOLDs don't disappear without a
+    trace. Keeps the log trimmed to the last NEAR_MISS_LOG_MAX_LINES lines.
+
+    Deliberately does NOT get called at all when the market is closed or
+    the candle is stale (see main()) - that would just recreate the same
+    noise problem in a different file.
+    """
     line = None
     ts = result.timestamp.strftime("%Y-%m-%d %H:%M:%S")
 
-    if result.suppressed_by_volatility:
+    if result.suppressed_by_trend:
+        line = (
+            f"[{ts}] BLOCKED (trend filter) - would have been {result.raw_direction} "
+            f"{result.raw_confidence}/4 @ {result.entry_price} | H1 trend {result.trend} "
+            f"actively opposes | reasons: {', '.join(result.raw_reasons)}"
+        )
+    elif result.suppressed_by_poor_rr:
+        line = (
+            f"[{ts}] SUPPRESSED (poor R:R after SR widening) - would have been "
+            f"{result.raw_direction} {result.raw_confidence}/4 @ {result.entry_price} | "
+            f"ATR {result.atr_value} | reasons: {', '.join(result.raw_reasons)}"
+        )
+    elif result.suppressed_by_volatility:
         line = (
             f"[{ts}] SUPPRESSED (volatility) - would have been {result.raw_direction} "
             f"{result.raw_confidence}/4 @ {result.entry_price} | ATR {result.atr_value} "
@@ -356,7 +554,6 @@ def log_near_miss(result):
     trimmed = existing[-NEAR_MISS_LOG_MAX_LINES:]
     NEAR_MISS_LOG.write_text("\n".join(trimmed) + "\n")
 
-
 # =====================================================================
 # STATE (so cooldown logic persists across scheduled runs)
 # =====================================================================
@@ -368,21 +565,42 @@ def load_state():
             pass
     return {"last_direction": None, "last_sent_time": None}
 
-
 def save_state(state):
     STATE_FILE.write_text(json.dumps(state))
-
 
 # =====================================================================
 # MAIN
 # =====================================================================
 def main():
+    now = datetime.now(timezone.utc)
+
+    # Market-hours gate FIRST, before any API calls - cheapest possible
+    # short-circuit, and the authoritative fix for the weekend false-fire
+    # bug (the GitHub Actions cron is trimmed to skip Saturday too, but
+    # this in-code check is what actually enforces it precisely).
+    if not market_is_open(now):
+        print(f"[{now}] Market closed (spot gold trades Sun 17:00 ET - Fri 17:00 ET). Skipping cycle.")
+        return
+
+    entry_df = get_candles(SYMBOL, ENTRY_TIMEFRAME, CANDLES_TO_FETCH)
+    htf_df = get_candles(SYMBOL, TREND_TIMEFRAME, CANDLES_TO_FETCH)
+
+    entry_df = trim_to_closed_candles(entry_df, ENTRY_TIMEFRAME_MINUTES, now)
+    htf_df = trim_to_closed_candles(htf_df, TREND_TIMEFRAME_MINUTES, now)
+
+    age_minutes = latest_candle_age_minutes(entry_df, now)
+    if age_minutes > MAX_CANDLE_AGE_MINUTES:
+        print(
+            f"[{now}] Latest closed candle is {age_minutes:.0f} min old "
+            f"(> {MAX_CANDLE_AGE_MINUTES} min threshold) - likely a holiday/feed gap, "
+            f"not a normal scheduling delay. Skipping cycle rather than analysing stale data."
+        )
+        return
+
     state = load_state()
     last_direction = state.get("last_direction")
     last_sent_time = datetime.fromisoformat(state["last_sent_time"]) if state.get("last_sent_time") else None
 
-    entry_df = get_candles(SYMBOL, ENTRY_TIMEFRAME, CANDLES_TO_FETCH)
-    htf_df = get_candles(SYMBOL, TREND_TIMEFRAME, CANDLES_TO_FETCH)
     result = analyse(entry_df, htf_df)
 
     print(f"[{result.timestamp}] {result.direction} (confidence {result.confidence}/4) @ {result.entry_price}")
@@ -393,7 +611,6 @@ def main():
 
     log_near_miss(result)
 
-    now = datetime.now()
     cooldown_ok = last_sent_time is None or (now - last_sent_time).total_seconds() > SIGNAL_COOLDOWN_MINUTES * 60
     is_new_direction = result.direction != last_direction
 
@@ -403,10 +620,12 @@ def main():
             state["last_sent_time"] = now.isoformat()
             save_state(state)
             print("Telegram alert sent.")
+        else:
+            print("No alert sent this cycle.")
+            save_state(state)
     else:
         print("No alert sent this cycle.")
         save_state(state)
-
 
 if __name__ == "__main__":
     main()
