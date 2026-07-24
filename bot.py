@@ -600,6 +600,15 @@ def main():
     state = load_state()
     last_direction = state.get("last_direction")
     last_sent_time = datetime.fromisoformat(state["last_sent_time"]) if state.get("last_sent_time") else None
+    if last_sent_time is not None and last_sent_time.tzinfo is None:
+        # state.json written by a pre-fix version of this bot stored a naive
+        # timestamp (from a naive datetime.now()). GitHub Actions runners are
+        # UTC, so that naive value was already effectively UTC - just label
+        # it as such rather than crashing when compared against the new
+        # timezone-aware `now`. Caught by an actual production run, not by
+        # the synthetic-data test harness (which never populated an
+        # old-format state.json) - real live testing over local testing.
+        last_sent_time = last_sent_time.replace(tzinfo=timezone.utc)
 
     result = analyse(entry_df, htf_df)
 
