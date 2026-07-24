@@ -56,6 +56,13 @@ CHANGELOG (this version):
   worse than intended. Rather than firing anyway because the confirmation
   count looks fine, the signal is suppressed if reward:risk would be
   below 1:1 once the real (possibly-widened) stop is accounted for.
+- NEW: trend-veto override. Observed directly in production 2026-07-24 -
+  a 2/4 SELL (RSI bearish + at resistance) got blocked by the hard trend
+  filter while H1 trend still read UP, during an active ~$12 drop, since
+  EMA50/200 lags a fresh reversal's actual start. A signal at 3/4+
+  confirmations now overrides the trend veto instead of being silenced by
+  a trend read that hasn't caught up yet - a 2/4 against the trend is
+  still blocked.
 """
 
 import json
@@ -94,6 +101,20 @@ SR_PROXIMITY = 5.0  # widened from 3.0 so "near" S/R triggers more easily
 
 MIN_CONFIRMATIONS = 2  # lowered from 3, out of 4 - fires more often
 SIGNAL_COOLDOWN_MINUTES = 10  # lowered from 30 - shorter than the 15min check cycle
+
+# ---- Trend-veto override ----
+# The hard trend filter (see analyse()) blocks a signal that opposes the H1
+# trend, since EMA50/200 is a lagging indicator - it can still be reading
+# the OLD trend during the early, fastest part of a genuine fresh reversal,
+# which is exactly when a real signal matters most. Observed directly in
+# production on 2026-07-24: a SELL with 2/4 confirmations (RSI bearish +
+# price at resistance) got blocked while H1 trend still read UP, during an
+# active ~$12 drop. Rather than removing the veto (which would bring back
+# the reversal-into-a-trend problem it was built to stop), a signal this
+# strong is allowed to override it - 2/4 against the trend still gets
+# blocked, 3/4+ does not, since that's enough independent confirmation to
+# treat as real evidence of a reversal rather than noise.
+TREND_VETO_OVERRIDE_CONFIRMATIONS = 3
 
 # ---- Volatility filter ----
 # Compares the current ATR to its own recent average. If the market is
@@ -412,10 +433,13 @@ def analyse(entry_df, htf_df):
 
     # Hard trend filter: block a signal that calls a reversal straight into
     # a strong opposing H1 trend, on top of trend counting as a vote above.
+    # Overridden if the signal is strong enough (see TREND_VETO_OVERRIDE_
+    # CONFIRMATIONS above) - a lagging trend read shouldn't silence a
+    # well-confirmed reversal, only a marginal one.
     suppressed_by_trend = False
-    if raw_direction == "BUY" and trend == "DOWN":
+    if raw_direction == "BUY" and trend == "DOWN" and raw_confidence < TREND_VETO_OVERRIDE_CONFIRMATIONS:
         suppressed_by_trend = True
-    elif raw_direction == "SELL" and trend == "UP":
+    elif raw_direction == "SELL" and trend == "UP" and raw_confidence < TREND_VETO_OVERRIDE_CONFIRMATIONS:
         suppressed_by_trend = True
 
     if suppressed_by_trend:
