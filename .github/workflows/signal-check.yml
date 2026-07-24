@@ -2,7 +2,16 @@ name: XAUUSD Signal Check
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    # Every 15 min, Sunday-Friday (day-of-week 0=Sun ... 6=Sat), skipping
+    # Saturday entirely - spot gold is always closed all day Saturday, so
+    # this is a free first line of defense (also saves Action minutes).
+    # This is NOT the authoritative market-hours check - it can't express
+    # "closed after 17:00 ET Friday" or "opens 17:00 ET Sunday" since cron
+    # only knows whole days. bot.py's own market_is_open() check (DST-aware,
+    # via zoneinfo) is what actually enforces the precise open/close times;
+    # this cron trim just avoids paying for 96 guaranteed-closed Saturday
+    # runs a week.
+    - cron: "*/15 * * * 0-5"
   workflow_dispatch: {}
 
 permissions:
