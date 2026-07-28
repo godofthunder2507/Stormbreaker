@@ -80,3 +80,4 @@
 [2026-07-28 15:24:52] BLOCKED (trend filter) - would have been BUY 2/4 @ 4032.29 | H1 trend DOWN actively opposes | reasons: RSI healthy/bullish at 51.5, Price near support (4027.94)
 [2026-07-28 16:59:40] BLOCKED (trend filter) - would have been BUY 2/4 @ 4041.94 | H1 trend DOWN actively opposes | reasons: RSI healthy/bullish at 57.4, Price near support (4040.35)
 [2026-07-28 21:32:39] SUPPRESSED (volatility) - would have been SELL 3/4 @ 4028.82 | ATR 4.433 vs baseline 6.358 (ratio 0.7) | reasons: RSI healthy/bearish at 48.8, Price near resistance (4029.28), H1 trend is DOWN
+[2026-07-28 22:42:41] SUPPRESSED (volatility) - would have been SELL 3/4 @ 4020.46 | ATR 4.259 vs baseline 6.278 (ratio 0.7) | reasons: MACD bearish crossover, RSI healthy/bearish at 36.9, H1 trend is DOWN
