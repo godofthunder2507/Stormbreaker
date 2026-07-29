@@ -63,10 +63,23 @@ CHANGELOG (this version):
   confirmations now overrides the trend veto instead of being silenced by
   a trend read that hasn't caught up yet - a 2/4 against the trend is
   still blocked.
+- NEW: gold-relevant news alerts. Every cycle now also pulls Finnhub's
+  free Market News feed (general + forex categories) and keyword-matches
+  headlines/summaries against a curated list of gold price drivers (Fed
+  policy, inflation prints, USD strength, safe-haven demand events, etc).
+  Anything new and gold-relevant gets its own distinct Telegram message -
+  this is completely separate from the BUY/SELL signal engine above, it
+  only relays factual headlines and never feeds into or biases a trade
+  call. Runs independent of market hours (news happens on days gold isn't
+  trading too), so it's checked BEFORE the market-hours gate below. A
+  cold start (first-ever run, empty state) seeds the seen-article set
+  without alerting, so it doesn't dump the whole recent news backlog as
+  alerts the moment this shipped.
 """
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -82,6 +95,7 @@ import requests
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "")
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
 
 SYMBOL = "XAU/USD"
 ENTRY_TIMEFRAME = "15min"
@@ -188,6 +202,26 @@ NEAR_MISS_LOG = Path(__file__).parent / "near_misses.log"
 NEAR_MISS_LOG_MAX_LINES = 300
 
 STATE_FILE = Path(__file__).parent / "state.json"
+
+# ---- Gold-relevant news alerting ----
+# Kept entirely separate from the trading-signal engine above: this only
+# relays factual headlines to Telegram, it never feeds into or biases a
+# BUY/SELL call. Finnhub's free tier includes the Market News endpoint
+# (category-filtered headlines) but NOT the Economic Calendar (that's
+# Premium-only) - confirmed directly against Finnhub's own docs before
+# building this, rather than assumed.
+NEWS_CATEGORIES = ["general", "forex"]
+# Broad-but-specific to gold's known price drivers, not a general market
+# news firehose. Matched case-insensitively against headline + summary.
+GOLD_NEWS_KEYWORDS = [
+    "gold", "xau", "bullion", "safe haven", "safe-haven",
+    "fed", "fomc", "powell", "rate hike", "rate cut", "interest rate",
+    "inflation", "cpi", "pce", "nonfarm", "non-farm", "jobs report", "payrolls",
+    "dollar", "usd", "treasury yield", "treasury yields",
+    "tariff", "war", "geopolitical", "recession", "sanctions",
+]
+# Cap on how many article IDs we remember for de-dup, oldest dropped first.
+NEWS_SEEN_ID_CAP = 500
 
 # =====================================================================
 # MARKET HOURS
@@ -528,6 +562,98 @@ def format_message(signal):
     return "\n".join(lines)
 
 # =====================================================================
+# GOLD-RELEVANT NEWS ALERTS (separate from the trading-signal engine)
+# =====================================================================
+def fetch_gold_news():
+    """Pull latest news from Finnhub's free Market News endpoint across
+    NEWS_CATEGORIES. Returns a list of article dicts (id, headline,
+    summary, source, url, datetime). Returns [] (not a crash) if the key
+    is missing or a category request fails, so a Finnhub hiccup never
+    takes down the trading side of the bot."""
+    if not FINNHUB_API_KEY:
+        print("[News] Skipped - FINNHUB_API_KEY not configured.")
+        return []
+    articles = []
+    for category in NEWS_CATEGORIES:
+        try:
+            resp = requests.get(
+                "https://finnhub.io/api/v1/news",
+                params={"category": category, "token": FINNHUB_API_KEY},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            articles.extend(resp.json())
+        except requests.RequestException as e:
+            print(f"[News] Failed to fetch '{category}' news: {e}")
+    return articles
+
+
+def is_gold_relevant(article):
+    """Word-boundary keyword match, not a bare substring check - a naive
+    `kw in text` match caught during local testing: "war" as a plain
+    substring also matches inside "award", "reward", "toward", "warranty",
+    "warm", etc, which would have quietly flooded alerts with unrelated
+    news. \\b...\\b keeps each keyword anchored to whole words instead."""
+    text = f"{article.get('headline', '')} {article.get('summary', '')}".lower()
+    return any(re.search(r"\b" + re.escape(kw) + r"\b", text) for kw in GOLD_NEWS_KEYWORDS)
+
+
+def format_news_message(article):
+    ts = article.get("datetime")
+    ts_line = ""
+    if ts:
+        ts_line = f"_{datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC_"
+    lines = [
+        "\U0001F4F0 *GOLD-RELEVANT NEWS*",
+        f"*{article.get('headline', '(no headline)')}*",
+        (article.get("summary") or "")[:400],
+        f"Source: {article.get('source', 'unknown')}",
+        article.get("url", ""),
+        ts_line,
+    ]
+    return "\n".join(line for line in lines if line)
+
+
+def check_news_alerts(state):
+    """Fetch news, alert on anything gold-relevant not already alerted.
+
+    On a cold start (no news state yet - e.g. this shipped moments ago),
+    the current article set is recorded as "already seen" WITHOUT
+    alerting on any of it - otherwise the very first run would dump the
+    entire recent news backlog as alerts instead of just new hits going
+    forward. Mutates `state` in place; caller is responsible for saving.
+    """
+    seen_list = state.get("seen_news_ids", [])
+    seen_set = set(seen_list)
+    is_cold_start = not state.get("news_seeded", False)
+
+    articles = fetch_gold_news()
+    new_count = 0
+    alerted = 0
+    for article in articles:
+        article_id = article.get("id")
+        if article_id is None or article_id in seen_set:
+            continue
+        seen_set.add(article_id)
+        seen_list.append(article_id)
+        new_count += 1
+        if is_cold_start:
+            continue
+        if is_gold_relevant(article):
+            if send_telegram(format_news_message(article)):
+                alerted += 1
+
+    state["seen_news_ids"] = seen_list[-NEWS_SEEN_ID_CAP:]
+    state["news_seeded"] = True
+
+    if is_cold_start:
+        print(f"[News] Cold start - seeded {new_count} article id(s), no alerts sent.")
+    elif alerted:
+        print(f"[News] Sent {alerted} gold-relevant news alert(s) ({new_count} new article(s) checked).")
+    else:
+        print(f"[News] Checked {len(articles)} article(s), {new_count} new, 0 gold-relevant matches this cycle.")
+
+# =====================================================================
 # NEAR-MISS LOGGING
 # =====================================================================
 def log_near_miss(result):
@@ -587,7 +713,12 @@ def load_state():
             return json.loads(STATE_FILE.read_text())
         except json.JSONDecodeError:
             pass
-    return {"last_direction": None, "last_sent_time": None}
+    return {
+        "last_direction": None,
+        "last_sent_time": None,
+        "seen_news_ids": [],
+        "news_seeded": False,
+    }
 
 def save_state(state):
     STATE_FILE.write_text(json.dumps(state))
@@ -598,12 +729,23 @@ def save_state(state):
 def main():
     now = datetime.now(timezone.utc)
 
-    # Market-hours gate FIRST, before any API calls - cheapest possible
-    # short-circuit, and the authoritative fix for the weekend false-fire
-    # bug (the GitHub Actions cron is trimmed to skip Saturday too, but
-    # this in-code check is what actually enforces it precisely).
+    # News check runs EVERY cycle, independent of market hours - gold-
+    # relevant news (Fed decisions, geopolitical shocks, etc) happens on
+    # any day, not just when spot gold is trading, so this deliberately
+    # runs before the market-hours gate below rather than being skipped
+    # alongside it. Entirely separate code path from the trading engine:
+    # a Finnhub outage here can't block or corrupt a BUY/SELL signal.
+    state = load_state()
+    check_news_alerts(state)
+    save_state(state)
+
+    # Market-hours gate for the TRADING side, before any price-feed API
+    # calls - cheapest possible short-circuit, and the authoritative fix
+    # for the weekend false-fire bug (the GitHub Actions cron is trimmed
+    # to skip Saturday too, but this in-code check is what actually
+    # enforces it precisely).
     if not market_is_open(now):
-        print(f"[{now}] Market closed (spot gold trades Sun 17:00 ET - Fri 17:00 ET). Skipping cycle.")
+        print(f"[{now}] Market closed (spot gold trades Sun 17:00 ET - Fri 17:00 ET). Skipping trading cycle (news already checked above).")
         return
 
     entry_df = get_candles(SYMBOL, ENTRY_TIMEFRAME, CANDLES_TO_FETCH)
@@ -621,7 +763,6 @@ def main():
         )
         return
 
-    state = load_state()
     last_direction = state.get("last_direction")
     last_sent_time = datetime.fromisoformat(state["last_sent_time"]) if state.get("last_sent_time") else None
     if last_sent_time is not None and last_sent_time.tzinfo is None:
