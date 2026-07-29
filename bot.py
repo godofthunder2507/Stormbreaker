@@ -113,7 +113,12 @@ ATR_PERIOD = 14
 SUPPORT_RESISTANCE_LOOKBACK = 50
 SR_PROXIMITY = 5.0  # widened from 3.0 so "near" S/R triggers more easily
 
-MIN_CONFIRMATIONS = 2  # lowered from 3, out of 4 - fires more often
+MIN_CONFIRMATIONS = 3  # raised back from 2 to 3, out of 4, per Sam 2026-07-29 -
+# fewer but higher-conviction signals. Side effect: TREND_VETO_OVERRIDE_CONFIRMATIONS
+# (below) is also 3, so the hard trend filter can no longer actually block anything -
+# any signal that now clears MIN_CONFIRMATIONS already qualifies for the override by
+# definition. Left in place (harmless, not dead-removed) in case MIN_CONFIRMATIONS is
+# ever lowered again later.
 SIGNAL_COOLDOWN_MINUTES = 10  # lowered from 30 - shorter than the 15min check cycle
 
 # ---- Trend-veto override ----
