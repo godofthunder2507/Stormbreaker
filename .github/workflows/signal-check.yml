@@ -2,16 +2,17 @@ name: XAUUSD Signal Check
 
 on:
   schedule:
-    # Every 15 min, Sunday-Friday (day-of-week 0=Sun ... 6=Sat), skipping
-    # Saturday entirely - spot gold is always closed all day Saturday, so
-    # this is a free first line of defense (also saves Action minutes).
-    # This is NOT the authoritative market-hours check - it can't express
-    # "closed after 17:00 ET Friday" or "opens 17:00 ET Sunday" since cron
-    # only knows whole days. bot.py's own market_is_open() check (DST-aware,
-    # via zoneinfo) is what actually enforces the precise open/close times;
-    # this cron trim just avoids paying for 96 guaranteed-closed Saturday
-    # runs a week.
-    - cron: "*/15 * * * 0-5"
+    # Every 15 min, every day of the week - including Saturday now.
+    #
+    # This used to skip Saturday entirely ("0-5" = Sun-Fri) since spot
+    # gold is always closed that day and there was nothing else for a run
+    # to do. That's no longer true: bot.py now also checks for gold-
+    # relevant news every cycle (Fed decisions, geopolitical shocks, etc),
+    # independent of market hours - and news doesn't take Saturday off.
+    # bot.py's own market_is_open() check still gates the TRADING side
+    # precisely (DST-aware, via zoneinfo); this cron change just means
+    # Saturday's runs now do news-checking work instead of doing nothing.
+    - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -37,6 +38,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
         run: python bot.py
 
       - name: Save state back to repo
