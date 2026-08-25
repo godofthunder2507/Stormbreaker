@@ -1,4 +1,3 @@
-[2026-07-28 12:56:13] NEAR MISS - would be BUY 1/4, 1 short @ 4033.91 | RSI 48.08 | Trend(H1) UP | reasons: H1 trend is UP
 [2026-07-28 15:24:52] BLOCKED (trend filter) - would have been BUY 2/4 @ 4032.29 | H1 trend DOWN actively opposes | reasons: RSI healthy/bullish at 51.5, Price near support (4027.94)
 [2026-07-28 16:59:40] BLOCKED (trend filter) - would have been BUY 2/4 @ 4041.94 | H1 trend DOWN actively opposes | reasons: RSI healthy/bullish at 57.4, Price near support (4040.35)
 [2026-07-28 21:32:39] SUPPRESSED (volatility) - would have been SELL 3/4 @ 4028.82 | ATR 4.433 vs baseline 6.358 (ratio 0.7) | reasons: RSI healthy/bearish at 48.8, Price near resistance (4029.28), H1 trend is DOWN
@@ -298,3 +297,4 @@
 [2026-08-25 17:54:38] NEAR MISS - would be BUY 2/4, 1 short @ 4643.06 | RSI 54.09 | Trend(H1) UP | reasons: RSI healthy/bullish at 54.1, H1 trend is UP
 [2026-08-25 18:30:59] NEAR MISS - would be BUY 2/4, 1 short @ 4649.89 | RSI 58.85 | Trend(H1) UP | reasons: RSI healthy/bullish at 58.9, H1 trend is UP
 [2026-08-25 19:16:54] NEAR MISS - would be BUY 2/4, 1 short @ 4660.61 | RSI 66.26 | Trend(H1) UP | reasons: RSI healthy/bullish at 66.3, H1 trend is UP
+[2026-08-25 19:54:19] NEAR MISS - would be BUY 2/4, 1 short @ 4662.86 | RSI 67.7 | Trend(H1) UP | reasons: RSI healthy/bullish at 67.7, H1 trend is UP
