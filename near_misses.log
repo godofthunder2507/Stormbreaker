@@ -1,4 +1,3 @@
-[2026-08-18 17:26:32] NEAR MISS - would be BUY 2/4, 1 short @ 4366.45 | RSI 38.87 | Trend(H1) UP | reasons: Price near support (4362.62), H1 trend is UP
 [2026-08-18 18:28:46] NEAR MISS - would be BUY 2/4, 1 short @ 4357.16 | RSI 32.68 | Trend(H1) UP | reasons: Price near support (4352.96), H1 trend is UP
 [2026-08-18 19:07:43] NEAR MISS - would be BUY 2/4, 1 short @ 4354.46 | RSI 32.92 | Trend(H1) UP | reasons: Price near support (4352.96), H1 trend is UP
 [2026-08-18 19:56:36] NEAR MISS - would be BUY 2/4, 1 short @ 4354.6 | RSI 34.0 | Trend(H1) UP | reasons: Price near support (4353.50), H1 trend is UP
@@ -298,3 +297,4 @@
 [2026-10-26 11:03:33] NEAR MISS - would be BUY 2/4, 1 short @ 4015.13 | RSI 56.39 | Trend(H1) DOWN | reasons: RSI healthy/bullish at 56.4, Price near support (4013.82)
 [2026-10-26 17:20:40] NEAR MISS - would be SELL 2/4, 1 short @ 4029.63 | RSI 63.73 | Trend(H1) DOWN | reasons: Price near resistance (4029.98), H1 trend is DOWN
 [2026-10-26 21:43:57] SUPPRESSED (volatility) - would have been BUY 3/4 @ 4017.08 | ATR 3.948 vs baseline 5.756 (ratio 0.7) | reasons: MACD bullish crossover, RSI healthy/bullish at 52.3, Price near support (4016.71)
+[2026-10-27 05:52:22] NEAR MISS - would be SELL 2/4, 1 short @ 4006.55 | RSI 42.08 | Trend(H1) DOWN | reasons: RSI healthy/bearish at 42.1, H1 trend is DOWN
